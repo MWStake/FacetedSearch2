@@ -2,14 +2,15 @@
 
 namespace DIQA\FacetedSearch2\Maintenance;
 
+use DIQA\FacetedSearch2\ConfigTools;
+use DIQA\FacetedSearch2\Exceptions\BackendException;
 use DIQA\FacetedSearch2\Update\FSIndexer;
 use MediaWiki\MediaWikiServices;
 use Title;
 
 /**
- * Updates the solr index.
+ * Updates the index.
  *
- * @ingroup EnhancedRetrieval
  */
 if (!file_exists(__DIR__ . '/../../../maintenance/Maintenance.php')) {
     echo "No wiki context found!\n";
@@ -17,7 +18,7 @@ if (!file_exists(__DIR__ . '/../../../maintenance/Maintenance.php')) {
 }
 require_once __DIR__ . '/../../../maintenance/Maintenance.php';
 
-class UpdateSolr extends \Maintenance
+class UpdateIndex extends \Maintenance
 {
 
     private $linkCache;
@@ -27,7 +28,7 @@ class UpdateSolr extends \Maintenance
     public function __construct()
     {
         parent::__construct();
-        $this->addDescription( "Updates SOLR index" );
+        $this->addDescription( "Updates the backend index used for Faceted Search 2" );
         $this->addOption('v', 'Verbose mode', false, false);
         $this->addOption('g', 'Get the maximum ID of pages that would be updated (all other parameters are ignored if this is present)', false, false);
         $this->addOption('d', 'Delay every 100 pages (miliseconds)', false, true);
@@ -47,13 +48,15 @@ class UpdateSolr extends \Maintenance
             die(1);
         }
 
+        $this->createIndexIfNecessary();
+
         if( $this->hasOption('g') ) {
             $max = $this->getMaxId();
             print "$max\n";
             return;
         }
 
-        // when indexing everything, we dont create any updating job for SOLR
+        // when indexing everything, we dont create any updating job for the index
         global $fsCreateUpdateJob;
         $fsCreateUpdateJob = false;
 
@@ -64,20 +67,24 @@ class UpdateSolr extends \Maintenance
         if (!$this->hasOption('p')) {
             $startId = $this->getStartId();
             $endId = $this->getEndId($startId);
-            $this->refreshPagesByIds($startId, $endId);
+            if (ConfigTools::getFacetedSearchUpdateClient()->supportBulkUpdates()) {
+                $this->refreshPagesByIdsBulk($startId, $endId);
+            } else {
+                $this->refreshPagesByIds($startId, $endId);
+            }
         } else {
             $pages = explode(',', $this->getOption('p'));
             $this->refreshPages($pages);
         }
 
-        print "{$this->num_files} IDs refreshed.\n";
+        print "\n\n{$this->num_files} IDs refreshed.\n";
     }
 
     /**
      * Print Documatation header
      */
     private function printDocHeader() {
-        print "Refreshing all semantic data in the SOLR server!\n---\n" .
+        print "Refreshing all semantic data in the index server!\n---\n" .
             " Some versions of PHP suffer from memory leaks in long-running scripts.\n" .
             " If your machine gets very slow after many pages (typically more than\n" .
             " 1000) were refreshed, please abort with CTRL-C and resume this script\n" .
@@ -125,6 +132,64 @@ class UpdateSolr extends \Maintenance
 
     }
 
+
+    /**
+     * Refresh all pages from ID start to ID end using bulk updates.
+     * Collects Title objects in batches and passes them as an array to updateIndexWithBatch().
+     * Writes last processed ID to a file if option 'startidfile' is set.
+     *
+     * @param int $start
+     * @param int $end
+     */
+    private function refreshPagesByIdsBulk($start, $end)
+    {
+        print "Processing all IDs from $start to " . ($end ? "$end" : 'last ID') . " ... (bulk mode)\n";
+
+        $batchSize = 100;
+        $titles = [];
+        $id = $start;
+        $lastIdInBatch = $start;
+
+        while (((! $end) || ($id <= $end)) && ($id > 0)) {
+            $title = Title::newFromID($id);
+
+            $id ++;
+            if (is_null($title)) {
+                continue;
+            }
+
+            $titles[] = $title;
+            $lastIdInBatch = $id;
+            $this->num_files ++;
+
+            if (count($titles) >= $batchSize) {
+                $this->logOnConsole($id, $batchSize, $titles);
+                $this->updateIndexWithBatch($titles);
+                $titles = [];
+
+                if ($this->hasOption('d')) {
+                    usleep($this->getOption('d'));
+                }
+                $this->linkCache->clear(); // avoid memory leaks
+
+                if ($this->writeToStartidfile) {
+                    file_put_contents($this->getOption('startidfile'), "$lastIdInBatch");
+                }
+            }
+        }
+
+        // flush remaining titles
+        if (count($titles) > 0) {
+            $this->logOnConsole($id, $batchSize, $titles);
+            $this->updateIndexWithBatch($titles);
+            $this->linkCache->clear();
+
+            if ($this->writeToStartidfile) {
+                file_put_contents($this->getOption('startidfile'), "$lastIdInBatch");
+            }
+        }
+    }
+
     /**
      * Refresh given pages.
      *
@@ -153,7 +218,7 @@ class UpdateSolr extends \Maintenance
     }
 
     /**
-     * Update SOLR index of $title.
+     * Update index of $title.
      *
      * @param Title $title
      */
@@ -161,12 +226,34 @@ class UpdateSolr extends \Maintenance
 
         try {
             $messages = [];
-            $response = FSIndexer::indexArticle($title, $messages);
+            FSIndexer::indexArticle($title, $messages);
             if ($this->hasOption('x')) {
-                print sprintf("\t[SUCCESSFULLY INDEXED]\n%s\n%s", $title->getPrefixedText(), $response);
+                print sprintf("\t[SUCCESSFULLY INDEXED]\n%s", $title->getPrefixedText());
             }
             if (count($messages) > 0) {
                 print implode("\t\n", $messages);
+            }
+        } catch (Exception $e) {
+            print sprintf("\t[NOT INDEXED] [HTTP code %s]\n", $e->getCode());
+            if ($this->hasOption('x')) {
+                print sprintf("\t[NOT INDEXED] %s\n", $e->getMessage());
+                print sprintf("%s\n", $e->getTraceAsString());
+                print "---------------------------------------------------------\n";
+            }
+        }
+    }
+
+
+    private function updateIndexWithBatch(array $titles) {
+
+        try {
+            $messages = [];
+            FSIndexer::indexArticles($titles, $messages);
+            if ($this->hasOption('x')) {
+                print sprintf("\t[SUCCESSFULLY INDEXED]\n%s", count($titles) . " pages");
+            }
+            if (count($messages) > 0) {
+                print "\n\n\t" . implode("\t\n", $messages) . "\n";
             }
         } catch (Exception $e) {
             print sprintf("\t[NOT INDEXED] [HTTP code %s]\n", $e->getCode());
@@ -245,8 +332,75 @@ class UpdateSolr extends \Maintenance
         }
         return 0;
     }
+
+    private function createIndexIfNecessary(): void
+    {
+
+        try {
+            $client = ConfigTools::getFacetedSearchUpdateClient();
+            if ($client->existsIndex()) {
+                if ($this->confirm("\nIndex already exists. Clear all documents and continue? (yes/no): ")) {
+                    $client->deleteIndex();
+                    $client->initIndex();
+                    print "\nIndex was deleted and re-created.\n";
+                } else {
+                    print "\nAborted.\n";
+                    die(1);
+                }
+            } else {
+                if ($client->initIndex()) {
+                    print "\nIndex created.\n";
+                }
+            }
+            $client->refreshIndex();
+
+        } catch (BackendException $e) {
+            echo("\nERROR: Creating the index failed. Reason: " . $e->getMessage());
+            die(1);
+        }
+    }
+
+    private function confirm(string $prompt): bool
+    {
+        while (true) {
+            print $prompt;
+            $handle = fopen("php://stdin", "r");
+            $line = fgets($handle);
+            fclose($handle);
+            $answer = strtolower(trim((string)$line));
+            if ($answer === 'yes' || $answer === 'y') {
+                return true;
+            }
+            if ($answer === 'no' || $answer === 'n') {
+                return false;
+            }
+            print "Please answer 'yes' or 'no'.\n";
+        }
+    }
+
+    /**
+     * @param int $id
+     * @param int $batchSize
+     * @param array $titles
+     * @return void
+     */
+    private function logOnConsole(int $id, int $batchSize, array $titles): void
+    {
+        if ($this->hasOption('v')) {
+            $startFrom = $id - $batchSize;
+            $startTitle = $titles[0]->getPrefixedText();
+            $endTitle = $titles[count($titles) - 1]->getPrefixedText();
+            print sprintf("\nProcessing IDs [%s to %s] [%s to %s]...",
+                $startFrom, $id, self::shorten($startTitle), self::shorten($endTitle));
+
+        }
+    }
+
+    private static function shorten(string $s) {
+        return mb_strlen($s) > 50 ?  trim(substr($s, 0, 50)) . "..." : $s;
+    }
 }
 
 global $maintClass;
-$maintClass = "DIQA\FacetedSearch2\Maintenance\UpdateSolr";
+$maintClass = "DIQA\FacetedSearch2\Maintenance\UpdateIndex";
 require_once RUN_MAINTENANCE_IF_MAIN;
